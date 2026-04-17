@@ -1,0 +1,662 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <title>Survivor Shooter</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { background: #000; overflow: hidden; }
+    canvas { display: block; cursor: crosshair; }
+  </style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script>
+// ═══════════════════════════════════════════════════════
+//  CONSTANTES
+// ═══════════════════════════════════════════════════════
+const WORLD      = 3000;
+const TILE       = 80;
+
+const P_RADIUS   = 18;
+const P_SPEED    = 220;
+const P_MAX_HP   = 100;
+const P_FIRE_CD  = 0.22;    // segundos entre disparos
+
+const B_SPEED    = 580;
+const B_RADIUS   = 5;
+const B_DAMAGE   = 25;
+const B_LIFE     = 1.8;     // segundos de vida de la bala
+
+const E_RADIUS   = 20;
+const E_BASE_SPEED  = 80;
+const E_BASE_HP     = 50;
+const E_DAMAGE   = 15;
+const E_DMG_CD   = 0.8;     // cooldown entre golpes del mismo enemigo
+
+const SPAWN_BASE_CD  = 1.2; // segundos entre spawns
+const SPAWN_DIST     = 720; // distancia de spawn al jugador
+
+// ═══════════════════════════════════════════════════════
+//  ESTADO GLOBAL
+// ═══════════════════════════════════════════════════════
+let canvas, ctx, W, H;
+let dt = 0, lastTs = 0;
+let gameState = 'intro';   // 'intro' | 'playing' | 'gameover'
+let killCount = 0;
+
+let cam   = { x: 0, y: 0 };
+let mouse = { x: 0, y: 0 };
+let keys  = {};
+let firing = false;
+
+let player, bullets, enemies, particles, spawnCd;
+
+function resetGame() {
+  player = {
+    x: WORLD / 2, y: WORLD / 2,
+    angle: 0,
+    hp: P_MAX_HP,
+    fireCd: 0,
+    hitFlash: 0,
+    shake: 0,
+  };
+  bullets   = [];
+  enemies   = [];
+  particles = [];
+  spawnCd   = 0;
+  killCount = 0;
+  firing    = false;
+}
+
+// ═══════════════════════════════════════════════════════
+//  INIT
+// ═══════════════════════════════════════════════════════
+window.onload = () => {
+  canvas = document.getElementById('game');
+  ctx    = canvas.getContext('2d');
+  resize();
+  window.addEventListener('resize', resize);
+
+  window.addEventListener('keydown', e => {
+    keys[e.key.toLowerCase()] = true;
+    if (['w','a','s','d','arrowup','arrowdown','arrowleft','arrowright',' '].includes(e.key.toLowerCase()))
+      e.preventDefault();
+  });
+  window.addEventListener('keyup', e => { keys[e.key.toLowerCase()] = false; });
+
+  canvas.addEventListener('mousemove', e => { mouse.x = e.clientX; mouse.y = e.clientY; });
+  canvas.addEventListener('mousedown', e => { if (e.button === 0) { firing = true;  handleClick(); } });
+  canvas.addEventListener('mouseup',   e => { if (e.button === 0)   firing = false; });
+  canvas.addEventListener('contextmenu', e => e.preventDefault());
+
+  resetGame();
+  requestAnimationFrame(loop);
+};
+
+function resize() {
+  canvas.width  = W = window.innerWidth;
+  canvas.height = H = window.innerHeight;
+}
+
+function handleClick() {
+  if (gameState === 'intro')    { gameState = 'playing'; }
+  else if (gameState === 'gameover') { resetGame(); gameState = 'playing'; }
+}
+
+// ═══════════════════════════════════════════════════════
+//  GAME LOOP
+// ═══════════════════════════════════════════════════════
+function loop(ts) {
+  dt = Math.min((ts - lastTs) / 1000, 0.05);
+  lastTs = ts;
+  if (gameState === 'playing') update(dt);
+  draw();
+  requestAnimationFrame(loop);
+}
+
+// ═══════════════════════════════════════════════════════
+//  UPDATE
+// ═══════════════════════════════════════════════════════
+function update(dt) {
+  updatePlayer(dt);
+  updateBullets(dt);
+  updateEnemies(dt);
+  updateParticles(dt);
+  updateSpawn(dt);
+  updateCamera();
+}
+
+// ── Player ──────────────────────────────────────────
+function updatePlayer(dt) {
+  const p = player;
+
+  // Movimiento WASD
+  let dx = 0, dy = 0;
+  if (keys['w'] || keys['arrowup'])    dy -= 1;
+  if (keys['s'] || keys['arrowdown'])  dy += 1;
+  if (keys['a'] || keys['arrowleft'])  dx -= 1;
+  if (keys['d'] || keys['arrowright']) dx += 1;
+  if (dx !== 0 || dy !== 0) {
+    const len = Math.hypot(dx, dy);
+    p.x += (dx / len) * P_SPEED * dt;
+    p.y += (dy / len) * P_SPEED * dt;
+  }
+  p.x = clamp(p.x, P_RADIUS, WORLD - P_RADIUS);
+  p.y = clamp(p.y, P_RADIUS, WORLD - P_RADIUS);
+
+  // Rotación hacia el mouse
+  const wx = mouse.x + cam.x;
+  const wy = mouse.y + cam.y;
+  p.angle = Math.atan2(wy - p.y, wx - p.x);
+
+  // Disparo
+  p.fireCd -= dt;
+  if (firing && p.fireCd <= 0) {
+    spawnBullet();
+    p.fireCd = P_FIRE_CD;
+  }
+
+  // Decay de efectos
+  p.hitFlash = Math.max(0, p.hitFlash - dt * 5);
+  p.shake    = Math.max(0, p.shake    - dt * 8);
+}
+
+function spawnBullet() {
+  const a  = player.angle;
+  const gx = player.x + Math.cos(a) * (P_RADIUS + 10);
+  const gy = player.y + Math.sin(a) * (P_RADIUS + 10);
+  bullets.push({
+    x: gx, y: gy,
+    vx: Math.cos(a) * B_SPEED,
+    vy: Math.sin(a) * B_SPEED,
+    life: B_LIFE,
+    dead: false,
+  });
+}
+
+// ── Bullets ─────────────────────────────────────────
+function updateBullets(dt) {
+  for (const b of bullets) {
+    if (b.dead) continue;
+    b.x    += b.vx * dt;
+    b.y    += b.vy * dt;
+    b.life -= dt;
+    if (b.life <= 0 || b.x < 0 || b.x > WORLD || b.y < 0 || b.y > WORLD) {
+      b.dead = true; continue;
+    }
+    for (const e of enemies) {
+      if (e.dead) continue;
+      if (dist(b.x, b.y, e.x, e.y) < B_RADIUS + E_RADIUS) {
+        e.hp -= B_DAMAGE;
+        b.dead = true;
+        spawnParticles(b.x, b.y, '#ff9900', 5, 80, 150, 0.25);
+        if (e.hp <= 0) killEnemy(e);
+        break;
+      }
+    }
+  }
+  bullets = bullets.filter(b => !b.dead);
+}
+
+// ── Enemies ─────────────────────────────────────────
+function updateEnemies(dt) {
+  const len = enemies.length;
+  for (let i = 0; i < len; i++) {
+    const e = enemies[i];
+    if (e.dead) continue;
+
+    // Moverse hacia el jugador
+    const dx = player.x - e.x;
+    const dy = player.y - e.y;
+    const d  = Math.hypot(dx, dy);
+    if (d > 0) {
+      e.x += (dx / d) * e.speed * dt;
+      e.y += (dy / d) * e.speed * dt;
+    }
+
+    // Empujarse entre enemigos (separación)
+    for (let j = i + 1; j < len; j++) {
+      const o = enemies[j];
+      if (o.dead) continue;
+      const ex = e.x - o.x, ey = e.y - o.y;
+      const ed = Math.hypot(ex, ey);
+      const minD = E_RADIUS * 2.2;
+      if (ed < minD && ed > 0) {
+        const push = (minD - ed) * 0.35;
+        const px = (ex / ed) * push, py = (ey / ed) * push;
+        e.x += px; e.y += py;
+        o.x -= px; o.y -= py;
+      }
+    }
+
+    // Daño al jugador por contacto
+    if (dist(e.x, e.y, player.x, player.y) < E_RADIUS + P_RADIUS) {
+      if (e.damageCd <= 0) {
+        player.hp -= E_DAMAGE;
+        player.hitFlash = 1;
+        player.shake    = 0.35;
+        e.damageCd = E_DMG_CD;
+        if (player.hp <= 0) {
+          player.hp = 0;
+          gameState = 'gameover';
+        }
+      }
+    }
+    e.damageCd = Math.max(0, e.damageCd - dt);
+  }
+  enemies = enemies.filter(e => !e.dead);
+}
+
+function killEnemy(e) {
+  e.dead = true;
+  killCount++;
+  spawnParticles(e.x, e.y, null, 14, 120, 260, 0.45, true);
+}
+
+// ── Spawn ────────────────────────────────────────────
+function updateSpawn(dt) {
+  spawnCd -= dt;
+  if (spawnCd <= 0) {
+    const batch = 1 + Math.floor(killCount / 15); // más enemigos por oleada según kills
+    for (let i = 0; i < batch; i++) spawnEnemy();
+    spawnCd = Math.max(0.35, SPAWN_BASE_CD - killCount * 0.008);
+  }
+}
+
+function spawnEnemy() {
+  const angle = Math.random() * Math.PI * 2;
+  const dist_ = SPAWN_DIST + Math.random() * 100;
+  const x = clamp(player.x + Math.cos(angle) * dist_, E_RADIUS, WORLD - E_RADIUS);
+  const y = clamp(player.y + Math.sin(angle) * dist_, E_RADIUS, WORLD - E_RADIUS);
+  const lvl = Math.floor(killCount / 10); // sube cada 10 kills
+  enemies.push({
+    x, y,
+    hp: E_BASE_HP + lvl * 15,
+    maxHp: E_BASE_HP + lvl * 15,
+    speed: E_BASE_SPEED + lvl * 8 + Math.random() * 25,
+    damageCd: 0,
+    dead: false,
+  });
+}
+
+// ── Particles ────────────────────────────────────────
+function spawnParticles(x, y, color, count, minS, maxS, life, death = false) {
+  for (let i = 0; i < count; i++) {
+    const a = Math.random() * Math.PI * 2;
+    const s = minS + Math.random() * (maxS - minS);
+    const c = death
+      ? `hsl(${5 + Math.random() * 25},100%,${50 + Math.random() * 20}%)`
+      : color;
+    particles.push({
+      x, y,
+      vx: Math.cos(a) * s, vy: Math.sin(a) * s,
+      life, maxLife: life,
+      r: death ? 3 + Math.random() * 5 : 2 + Math.random() * 2,
+      color: c,
+    });
+  }
+}
+
+function updateParticles(dt) {
+  for (const p of particles) {
+    p.x    += p.vx * dt;
+    p.y    += p.vy * dt;
+    p.vx   *= 0.90;
+    p.vy   *= 0.90;
+    p.life -= dt;
+  }
+  particles = particles.filter(p => p.life > 0);
+}
+
+// ── Camera ───────────────────────────────────────────
+function updateCamera() {
+  const shakeX = player.shake > 0 ? (Math.random() - 0.5) * 12 * player.shake : 0;
+  const shakeY = player.shake > 0 ? (Math.random() - 0.5) * 12 * player.shake : 0;
+  cam.x = player.x - W / 2 + shakeX;
+  cam.y = player.y - H / 2 + shakeY;
+}
+
+// ═══════════════════════════════════════════════════════
+//  DRAW
+// ═══════════════════════════════════════════════════════
+function draw() {
+  ctx.clearRect(0, 0, W, H);
+  ctx.save();
+  ctx.translate(-cam.x, -cam.y);
+  drawWorld();
+  drawParticlesBehind();
+  drawBullets();
+  drawEnemies();
+  drawPlayer();
+  ctx.restore();
+  drawHUD();
+  if (gameState === 'intro')    drawIntro();
+  if (gameState === 'gameover') drawGameOver();
+}
+
+// ── World ────────────────────────────────────────────
+function drawWorld() {
+  // Fondo
+  ctx.fillStyle = '#0d1117';
+  ctx.fillRect(cam.x, cam.y, W, H);
+
+  // Grid
+  ctx.strokeStyle = 'rgba(255,255,255,0.035)';
+  ctx.lineWidth = 1;
+  const sx = Math.floor(cam.x / TILE) * TILE;
+  const sy = Math.floor(cam.y / TILE) * TILE;
+  for (let x = sx; x < cam.x + W + TILE; x += TILE) {
+    ctx.beginPath(); ctx.moveTo(x, cam.y); ctx.lineTo(x, cam.y + H); ctx.stroke();
+  }
+  for (let y = sy; y < cam.y + H + TILE; y += TILE) {
+    ctx.beginPath(); ctx.moveTo(cam.x, y); ctx.lineTo(cam.x + W, y); ctx.stroke();
+  }
+
+  // Borde del mundo
+  ctx.strokeStyle = 'rgba(100,200,255,0.12)';
+  ctx.lineWidth = 6;
+  ctx.strokeRect(0, 0, WORLD, WORLD);
+
+  // Zona roja fuera del mundo
+  ctx.fillStyle = 'rgba(200,30,30,0.06)';
+  const pad = 60;
+  ctx.fillRect(-pad, -pad, WORLD + pad * 2, pad);
+  ctx.fillRect(-pad, WORLD, WORLD + pad * 2, pad);
+  ctx.fillRect(-pad, -pad, pad, WORLD + pad * 2);
+  ctx.fillRect(WORLD, -pad, pad, WORLD + pad * 2);
+}
+
+// ── Player ───────────────────────────────────────────
+function drawPlayer() {
+  const p = player;
+  ctx.save();
+  ctx.translate(p.x, p.y);
+
+  // Sombra
+  ctx.beginPath();
+  ctx.arc(4, 6, P_RADIUS, 0, Math.PI * 2);
+  ctx.fillStyle = 'rgba(0,0,0,0.35)';
+  ctx.fill();
+
+  // Glow de daño
+  if (p.hitFlash > 0) {
+    ctx.beginPath();
+    ctx.arc(0, 0, P_RADIUS + 8, 0, Math.PI * 2);
+    ctx.fillStyle = `rgba(255,60,60,${p.hitFlash * 0.45})`;
+    ctx.fill();
+  }
+
+  // Cañón del arma
+  ctx.save();
+  ctx.rotate(p.angle);
+  ctx.fillStyle = '#6a6a6a';
+  ctx.fillRect(P_RADIUS - 2, -6, 22, 12);
+  ctx.fillStyle = '#999';
+  ctx.fillRect(P_RADIUS, -4, 20, 8);
+  // Boca del cañón
+  ctx.fillStyle = '#444';
+  ctx.fillRect(P_RADIUS + 18, -5, 5, 10);
+  ctx.restore();
+
+  // Cuerpo del jugador
+  const g = ctx.createRadialGradient(-5, -5, 2, 0, 0, P_RADIUS);
+  if (p.hitFlash > 0) {
+    g.addColorStop(0, `rgba(255,${Math.floor(100*(1-p.hitFlash))},${Math.floor(100*(1-p.hitFlash))},1)`);
+    g.addColorStop(1, `rgba(180,20,20,1)`);
+  } else {
+    g.addColorStop(0, '#5ee8bc');
+    g.addColorStop(1, '#1a7a5e');
+  }
+  ctx.beginPath();
+  ctx.arc(0, 0, P_RADIUS, 0, Math.PI * 2);
+  ctx.fillStyle = g;
+  ctx.fill();
+  ctx.strokeStyle = 'rgba(255,255,255,0.25)';
+  ctx.lineWidth = 2;
+  ctx.stroke();
+
+  // Punto de dirección en el cuerpo
+  ctx.save();
+  ctx.rotate(p.angle);
+  ctx.fillStyle = 'rgba(255,255,255,0.7)';
+  ctx.beginPath();
+  ctx.arc(P_RADIUS - 6, 0, 4, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.restore();
+
+  ctx.restore();
+}
+
+// ── Enemies ──────────────────────────────────────────
+function drawEnemies() {
+  for (const e of enemies) {
+    if (e.dead) continue;
+    const hpRatio = e.hp / e.maxHp;
+    const toPlayer = Math.atan2(player.y - e.y, player.x - e.x);
+
+    ctx.save();
+    ctx.translate(e.x, e.y);
+
+    // Glow
+    ctx.beginPath();
+    ctx.arc(0, 0, E_RADIUS + 5, 0, Math.PI * 2);
+    ctx.fillStyle = 'rgba(220,40,40,0.12)';
+    ctx.fill();
+
+    // Cuerpo
+    const eg = ctx.createRadialGradient(-4, -4, 2, 0, 0, E_RADIUS);
+    eg.addColorStop(0, `hsl(${hpRatio * 20 + 2},100%,68%)`);
+    eg.addColorStop(1, `hsl(${hpRatio * 20 + 2},90%,28%)`);
+    ctx.beginPath();
+    ctx.arc(0, 0, E_RADIUS, 0, Math.PI * 2);
+    ctx.fillStyle = eg;
+    ctx.fill();
+    ctx.strokeStyle = `rgba(255,100,80,0.5)`;
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+
+    // Ojos apuntando al jugador
+    ctx.rotate(toPlayer);
+    ctx.fillStyle = '#fff';
+    ctx.beginPath(); ctx.arc(7, -5, 4, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath(); ctx.arc(7,  5, 4, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = '#1a0000';
+    ctx.beginPath(); ctx.arc(9, -5, 2.2, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath(); ctx.arc(9,  5, 2.2, 0, Math.PI * 2); ctx.fill();
+    ctx.restore();
+
+    // Barra de HP (solo si no está llena)
+    if (hpRatio < 1) {
+      const bw = 44, bh = 5;
+      const bx = e.x - bw / 2, by = e.y - E_RADIUS - 12;
+      ctx.fillStyle = 'rgba(0,0,0,0.6)';
+      ctx.fillRect(bx - 1, by - 1, bw + 2, bh + 2);
+      ctx.fillStyle = '#300';
+      ctx.fillRect(bx, by, bw, bh);
+      ctx.fillStyle = `hsl(${hpRatio * 120}, 100%, 42%)`;
+      ctx.fillRect(bx, by, bw * hpRatio, bh);
+    }
+  }
+}
+
+// ── Bullets ──────────────────────────────────────────
+function drawBullets() {
+  for (const b of bullets) {
+    // Trail
+    const tx = b.x - (b.vx / B_SPEED) * 22;
+    const ty = b.y - (b.vy / B_SPEED) * 22;
+    const trail = ctx.createLinearGradient(b.x, b.y, tx, ty);
+    trail.addColorStop(0, 'rgba(255,220,60,0.8)');
+    trail.addColorStop(1, 'rgba(255,80,0,0)');
+    ctx.beginPath();
+    ctx.moveTo(b.x, b.y);
+    ctx.lineTo(tx, ty);
+    ctx.strokeStyle = trail;
+    ctx.lineWidth = B_RADIUS * 1.8;
+    ctx.lineCap = 'round';
+    ctx.stroke();
+
+    // Glow
+    ctx.beginPath();
+    ctx.arc(b.x, b.y, B_RADIUS + 5, 0, Math.PI * 2);
+    ctx.fillStyle = 'rgba(255,200,50,0.2)';
+    ctx.fill();
+
+    // Core
+    ctx.beginPath();
+    ctx.arc(b.x, b.y, B_RADIUS, 0, Math.PI * 2);
+    ctx.fillStyle = '#ffe55a';
+    ctx.fill();
+  }
+}
+
+// ── Particles ────────────────────────────────────────
+function drawParticlesBehind() {
+  for (const p of particles) {
+    const alpha = Math.max(0, p.life / p.maxLife);
+    ctx.save();
+    ctx.globalAlpha = alpha;
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, p.r * alpha, 0, Math.PI * 2);
+    ctx.fillStyle = p.color;
+    ctx.fill();
+    ctx.restore();
+  }
+}
+
+// ── HUD ──────────────────────────────────────────────
+function drawHUD() {
+  // Panel HP (abajo izquierda)
+  const bw = 240, bh = 20, bx = 20, by = H - 52;
+  ctx.fillStyle = 'rgba(0,0,0,0.55)';
+  roundRect(ctx, bx - 8, by - 22, bw + 16, bh + 30, 8);
+  ctx.fill();
+
+  ctx.fillStyle = 'rgba(255,255,255,0.08)';
+  ctx.fillRect(bx, by, bw, bh);
+  const hpRatio = player.hp / P_MAX_HP;
+  const hpColor = hpRatio > 0.5 ? '#4ecca3' : hpRatio > 0.25 ? '#f5a623' : '#e94560';
+  ctx.fillStyle = hpColor;
+  ctx.fillRect(bx, by, bw * hpRatio, bh);
+  ctx.strokeStyle = 'rgba(255,255,255,0.15)';
+  ctx.lineWidth = 1;
+  ctx.strokeRect(bx, by, bw, bh);
+
+  ctx.fillStyle = '#fff';
+  ctx.font = 'bold 11px monospace';
+  ctx.textAlign = 'center';
+  ctx.fillText(`${player.hp} / ${P_MAX_HP}`, bx + bw / 2, by + 14);
+
+  ctx.fillStyle = hpColor;
+  ctx.font = 'bold 12px monospace';
+  ctx.textAlign = 'left';
+  ctx.fillText('VIDA', bx, by - 6);
+
+  // Arma (abajo derecha)
+  ctx.fillStyle = 'rgba(0,0,0,0.55)';
+  roundRect(ctx, W - 150, H - 50, 130, 38, 8);
+  ctx.fill();
+  ctx.fillStyle = '#ffe55a';
+  ctx.font = 'bold 14px monospace';
+  ctx.textAlign = 'right';
+  ctx.fillText('PISTOLA', W - 22, H - 27);
+  ctx.fillStyle = '#666';
+  ctx.font = '10px monospace';
+  ctx.fillText('ARMA EQUIPADA', W - 22, H - 14);
+
+  // Kills (arriba derecha)
+  ctx.fillStyle = 'rgba(0,0,0,0.55)';
+  roundRect(ctx, W - 140, 14, 118, 52, 8);
+  ctx.fill();
+  ctx.fillStyle = '#e94560';
+  ctx.font = 'bold 34px monospace';
+  ctx.textAlign = 'right';
+  ctx.fillText(killCount, W - 22, 55);
+  ctx.fillStyle = '#888';
+  ctx.font = '10px monospace';
+  ctx.fillText('KILLS', W - 22, 30);
+
+  // Enemigos activos (arriba izquierda)
+  ctx.fillStyle = 'rgba(0,0,0,0.55)';
+  roundRect(ctx, 14, 14, 150, 40, 8);
+  ctx.fill();
+  ctx.fillStyle = 'rgba(255,80,80,0.85)';
+  ctx.font = 'bold 13px monospace';
+  ctx.textAlign = 'left';
+  ctx.fillText(`ENEMIGOS: ${enemies.length}`, 22, 32);
+  const lvl = Math.floor(killCount / 10) + 1;
+  ctx.fillStyle = '#aaa';
+  ctx.font = '10px monospace';
+  ctx.fillText(`DIFICULTAD: ${lvl}`, 22, 47);
+}
+
+// ── Pantallas ────────────────────────────────────────
+function drawIntro() {
+  ctx.fillStyle = 'rgba(0,0,0,0.7)';
+  ctx.fillRect(0, 0, W, H);
+
+  ctx.textAlign = 'center';
+  ctx.fillStyle = '#4ecca3';
+  ctx.font = 'bold 52px monospace';
+  ctx.fillText('SURVIVOR', W / 2, H / 2 - 80);
+  ctx.fillStyle = '#e94560';
+  ctx.font = 'bold 52px monospace';
+  ctx.fillText('SHOOTER', W / 2, H / 2 - 20);
+
+  ctx.fillStyle = 'rgba(255,255,255,0.7)';
+  ctx.font = '16px monospace';
+  ctx.fillText('WASD  ·  mover        RATÓN  ·  apuntar        CLIC  ·  disparar', W / 2, H / 2 + 50);
+
+  ctx.fillStyle = '#ffe55a';
+  ctx.font = 'bold 20px monospace';
+  const blink = Math.floor(Date.now() / 500) % 2;
+  if (blink) ctx.fillText('— CLIC PARA COMENZAR —', W / 2, H / 2 + 110);
+}
+
+function drawGameOver() {
+  ctx.fillStyle = 'rgba(0,0,0,0.78)';
+  ctx.fillRect(0, 0, W, H);
+
+  ctx.textAlign = 'center';
+  ctx.fillStyle = '#e94560';
+  ctx.font = 'bold 68px monospace';
+  ctx.fillText('GAME OVER', W / 2, H / 2 - 70);
+
+  ctx.fillStyle = '#fff';
+  ctx.font = '26px monospace';
+  ctx.fillText(`Monstruos eliminados: ${killCount}`, W / 2, H / 2);
+
+  const lvl = Math.floor(killCount / 10) + 1;
+  ctx.fillStyle = '#888';
+  ctx.font = '18px monospace';
+  ctx.fillText(`Dificultad alcanzada: ${lvl}`, W / 2, H / 2 + 38);
+
+  ctx.fillStyle = '#4ecca3';
+  ctx.font = '20px monospace';
+  const blink = Math.floor(Date.now() / 500) % 2;
+  if (blink) ctx.fillText('— CLIC PARA REINTENTAR —', W / 2, H / 2 + 95);
+}
+
+// ═══════════════════════════════════════════════════════
+//  UTILS
+// ═══════════════════════════════════════════════════════
+function dist(x1, y1, x2, y2) { return Math.hypot(x2 - x1, y2 - y1); }
+function clamp(v, lo, hi)      { return v < lo ? lo : v > hi ? hi : v; }
+
+function roundRect(ctx, x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.lineTo(x + w - r, y);
+  ctx.quadraticCurveTo(x + w, y, x + w, y + r);
+  ctx.lineTo(x + w, y + h - r);
+  ctx.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
+  ctx.lineTo(x + r, y + h);
+  ctx.quadraticCurveTo(x, y + h, x, y + h - r);
+  ctx.lineTo(x, y + r);
+  ctx.quadraticCurveTo(x, y, x + r, y);
+  ctx.closePath();
+}
+</script>
+</body>
+</html>
